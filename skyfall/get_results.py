@@ -38,7 +38,9 @@ if __name__ == "__main__":
     
     # fig-10, fig-11a, fig-11b
     legal_traffic = []
-    for subdir in os.listdir('../' + cons_name + '/' + topologies[0] + "_data/link_traffic_data"):
+    base_path = '../' + cons_name + '/' + topologies[0] + "_data/link_traffic_data"
+    subdirs = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d)) and d.isdigit()]
+    for subdir in sorted(subdirs, key=int):
         subdir_path = os.path.join('../' + cons_name + '/' + topologies[0] + "_data/link_traffic_data", subdir)
         if os.path.isdir(subdir_path):
             # background traffic
@@ -56,7 +58,8 @@ if __name__ == "__main__":
     gsl_ratios = []
     
     time_slot = 0
-    for subdir in os.listdir(folder_path):
+    subdirs = [d for d in os.listdir(folder_path) if os.path.isdir(os.path.join(folder_path, d)) and d.isdigit()]
+    for subdir in sorted(subdirs, key=int):
         subdir_path = os.path.join(folder_path, subdir)
         if os.path.isdir(subdir_path):
             # (Ratio of) reduced traffic by skyfall
