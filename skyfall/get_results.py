@@ -18,7 +18,10 @@ inclination = table["Inclination"]
 average_gsl_num = 574 # average_gsl_num for starlink
 
 ratios = [0.9, 0.8, 0.7, 0.6, 0.5]
-topologies = ['+grid', 'circle']
+# 설치된(생성된) 데이터만 대상으로 동적으로 결정
+topologies = [t for t in ['+grid', 'circle']
+              if os.path.isdir('../' + cons_name + '/' + t + '_data')]
+# grid가 기본 베이스이므로 최소한 +grid는 존재해야 함
 bot_num = 0  # total number of malicious terminals
 traffic_thre = 20  # upmost 20 malicious terminals accessed to a satellite
 GSL_capacity = 4096
@@ -119,9 +122,11 @@ if __name__ == "__main__":
     gsl_ratios = []
 
     time_slot = 0
-    for subdir in os.listdir(folder_path):
-        subdir_path = os.path.join(folder_path, subdir)
-        if os.path.isdir(subdir_path):
+    if os.path.isdir(folder_path):
+        for subdir in os.listdir(folder_path):
+            subdir_path = os.path.join(folder_path, subdir)
+            if not os.path.isdir(subdir_path):
+                continue
             # (Ratio of) reduced traffic by icarus
             icarus_traffic_file_path = os.path.join(subdir_path, 'cumu_affected_traffic_volume_950.txt')
             if os.path.exists(icarus_traffic_file_path):
@@ -171,16 +176,17 @@ if __name__ == "__main__":
                     botnet_size_for_skyfall.append(values[0])
             # icarus bot_num 
             icarus_bot_size = []
-            for subdir in os.listdir(icarus_folder_path):
-                subdir_path = os.path.join(icarus_folder_path, subdir)
-                if os.path.isdir(subdir_path):
-                    icarus_botnum_file_path = os.path.join(subdir_path, 'bot_num.txt')
-                    if os.path.exists(icarus_botnum_file_path):
-                        with open(icarus_botnum_file_path, 'r') as file:
-                            values = [float(line.strip()) for line in file]
-                            if values[0] > 0:
-                                icarus_bot_size.append(values[0])
-            botnet_size_for_icarus.append(int(sum(icarus_bot_size) / len(icarus_bot_size)))
+            if os.path.isdir(icarus_folder_path):
+                for subdir in os.listdir(icarus_folder_path):
+                    subdir_path = os.path.join(icarus_folder_path, subdir)
+                    if os.path.isdir(subdir_path):
+                        icarus_botnum_file_path = os.path.join(subdir_path, 'bot_num.txt')
+                        if os.path.exists(icarus_botnum_file_path):
+                            with open(icarus_botnum_file_path, 'r') as file:
+                                values = [float(line.strip()) for line in file]
+                                if values[0] > 0:
+                                    icarus_bot_size.append(values[0])
+            botnet_size_for_icarus.append(int(sum(icarus_bot_size) / len(icarus_bot_size)) if icarus_bot_size else 0)
         sub_dir = 'fig-12a' if topology == topologies[0] else 'fig-12b'
             
         output_file = '../' + cons_name + '/results' + '/' + sub_dir + '/botnet_size_for_skyfall.txt'
@@ -209,15 +215,16 @@ if __name__ == "__main__":
             skyfall_block_num_file_path = os.path.join(skyfall_folder_path, 'bot_block.txt')
             # icarus block_num 
             icarus_block_num = []
-            for subdir in os.listdir(icarus_folder_path):
-                subdir_path = os.path.join(icarus_folder_path, subdir)
-                if os.path.isdir(subdir_path):
-                    icarus_block_num_file_path = os.path.join(subdir_path, 'block_num.txt')
-                    if os.path.exists(icarus_block_num_file_path):
-                        with open(icarus_block_num_file_path, 'r') as file:
-                            values = [float(line.strip()) for line in file]
-                            icarus_block_num.append(values[0])
-            number_blocks_icarus.append(int(sum(icarus_block_num) / len(icarus_block_num)))
+            if os.path.isdir(icarus_folder_path):
+                for subdir in os.listdir(icarus_folder_path):
+                    subdir_path = os.path.join(icarus_folder_path, subdir)
+                    if os.path.isdir(subdir_path):
+                        icarus_block_num_file_path = os.path.join(subdir_path, 'block_num.txt')
+                        if os.path.exists(icarus_block_num_file_path):
+                            with open(icarus_block_num_file_path, 'r') as file:
+                                values = [float(line.strip()) for line in file]
+                                icarus_block_num.append(values[0])
+            number_blocks_icarus.append(int(sum(icarus_block_num) / len(icarus_block_num)) if icarus_block_num else 0)
 
         sub_dir = 'fig-13a' if topology == topologies[0] else 'fig-13b'
             
@@ -235,14 +242,16 @@ if __name__ == "__main__":
                 
     # fig-14a, fig-14b
     for topology in topologies:
-        malicious_uplink_throughput_degradation = [[] for i in range(len(ratios))] # throughput for various degradation
+        # grid/circle 구분을 인덱스가 아니라 이름으로
+        is_grid = (topology == '+grid')
+        malicious_uplink_throughput_degradation = [[] for _ in ratios]  # throughput for various degradation
         background_traffic = []
         for index, ratio in enumerate(ratios):
             malicious_uplink_throughput = np.zeros(sat_per_cycle * orbit_num)
-            if topology == topologies[0]:
+            if is_grid:
                 for sat_id in range(-int(ratio*120)+96):
                     malicious_uplink_throughput[sat_id] = unit_traffic * (sat_id%4 +1)
-            elif topology == topologies[1]:
+            else:
                 for sat_id in range(-int(ratio*100)+140):
                     malicious_uplink_throughput[sat_id] = unit_traffic * (sat_id%4 +1)
             skyfall_folder_path = '../' + cons_name + '/' + topology + "_data/attack_traffic_data_land_only_bot/" + str(ratio) + "-" +  str(traffic_thre) + "-" + str(sat_per_cycle) + "-" + str(GSL_capacity) + "-" + str(unit_traffic) + "/0/"
@@ -255,34 +264,26 @@ if __name__ == "__main__":
                     for key, value in count.items():
                         malicious_uplink_throughput[int(key)] = int(value * unit_traffic) if value <= traffic_thre else unit_traffic * traffic_thre
                     malicious_uplink_throughput_degradation[index] = np.sort(malicious_uplink_throughput)
+                # 현재 topology의 백그라운드 트래픽을 읽음
         downlink_traffic = []
-        if os.path.isdir('../' + cons_name + '/' + topologies[0] + "_data/link_traffic_data/0"):
-            # background traffic
-            downlink_traffic_file_path = os.path.join('../' + cons_name + '/' + topologies[0] + "_data/link_traffic_data/0", 'downlink_traffic.txt')
+        topo_link_dir = '../' + cons_name + '/' + topology + "_data/link_traffic_data/0"
+        if os.path.isdir(topo_link_dir):
+            downlink_traffic_file_path = os.path.join(topo_link_dir, 'downlink_traffic.txt')
             if os.path.exists(downlink_traffic_file_path):
                 with open(downlink_traffic_file_path, 'r') as file:
                     downlink_traffic = [float(line.strip()) for line in file]
                     downlink_traffic = np.sort(downlink_traffic)
-                    
-        if topology == topologies[0]:
-            for i in range (len(ratios)):
-                output_file = '../' + cons_name + '/results' + '/fig-14a/malicious_uplink_throughput_degradation_' + str(int(100-100*ratios[i])) + '_percent.txt'
-                with open(output_file, 'w') as file:
-                    for value in malicious_uplink_throughput_degradation[i]:
-                        file.write(str(value) + '\n')
-            output_file = '../' + cons_name + '/results' + '/fig-14a/background_traffic.txt'
+
+        # 결과 디렉토리 선택 (grid→fig-14a, circle→fig-14b)
+        sub_dir = 'fig-14a' if is_grid else 'fig-14b'
+        for i in range(len(ratios)):
+            output_file = '../' + cons_name + '/results' + '/' + sub_dir + '/malicious_uplink_throughput_degradation_' + str(int(100-100*ratios[i])) + '_percent.txt'
             with open(output_file, 'w') as file:
-                for value in downlink_traffic:
+                for value in malicious_uplink_throughput_degradation[i]:
                     file.write(str(value) + '\n')
-        if topology == topologies[1]:
-            for i in range (len(ratios)):
-                output_file = '../' + cons_name + '/results' + '/fig-14b/malicious_uplink_throughput_degradation_' + str(int(100-100*ratios[i])) + '_percent.txt'
-                with open(output_file, 'w') as file:
-                    for value in malicious_uplink_throughput_degradation[i]:
-                        file.write(str(value) + '\n')
-            output_file = '../' + cons_name + '/results' + '/fig-14b/background_traffic.txt'
-            with open(output_file, 'w') as file:
-                for value in downlink_traffic:
-                    file.write(str(value) + '\n')
+        output_file = '../' + cons_name + '/results' + '/' + sub_dir + '/background_traffic.txt'
+        with open(output_file, 'w') as file:
+            for value in downlink_traffic:
+                file.write(str(value) + '\n')
 
     
