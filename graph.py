@@ -10,12 +10,8 @@ import re
 # User settings (generalized for multiple tests)
 # =========================
 TESTS = [
-    ("Original Routing", Path("./test_04_original_3600")),
-    ("PCDR (p=0.8, S=0.05)", Path("./test_04_3600")),
-    ("PCDR (p=0.8, S=0.01)", Path("./test_04_08_001_3600")),
-    ("PCDR (p=0.8, S=0.10)", Path("./test_04_08_010_3600")),
-    ("K-DS", Path("./test_04_K-DS_100")),
-
+    ("Original Routing", Path("./test_06_original_3600")),
+    ("PCDR (p=0.8, S=0.05)", Path("./test_06_3600")),
 ]
 
 # Preferred baseline and primary PCDR label for Fig-1/2/3 comparisons
@@ -30,8 +26,24 @@ FILE_UL  = "uplink_loss.txt"           # (sat_num)
 FILE_LL  = "link_loss.txt"             # (sat_num*6)  (not used for heatmaps)
 FILE_BLK = "blocked_loss_total.txt"    # single-line total
 
+# --- NEW: loss-rate / latency files (per time folder) ---
+FILE_PKT_LOSS_RATE = "packet_loss_rate.txt"
+FILE_CHUNK_LOSS_RATE = "chunk_loss_rate.txt"
+
+FILE_PKT_LAT_MEAN = "packet_latency_mean_ms.txt"
+FILE_CHUNK_LAT_MEAN = "chunk_latency_mean_ms.txt"
+
+FILE_PKT_LAT_P95 = "packet_latency_p95_ms.txt"
+FILE_PKT_LAT_P99 = "packet_latency_p99_ms.txt"
+FILE_CHUNK_LAT_P95 = "chunk_latency_p95_ms.txt"
+FILE_CHUNK_LAT_P99 = "chunk_latency_p99_ms.txt"
+
+FILE_PKT_LAT_SAMPLE = "packet_latency_sample_ms.txt"
+FILE_CHUNK_LAT_SAMPLE = "chunk_latency_sample_ms.txt"
+
+
 # Time-series range for grid data
-T_START, T_END = 0, 100
+T_START, T_END = 0,3600
 
 # Time range for results/ series (None → full)
 RES_T_START: Optional[int] = None
@@ -134,6 +146,39 @@ def read_numbers_series(path: Path) -> Optional[np.ndarray]:
         except ValueError:
             warn(f"Numeric parse failed ({path}, line {i}): '{s}' → skipped")
     return np.array(out, dtype=float)
+
+def read_scalar(path: Path) -> float:
+    arr = read_numbers_series(path)
+    if arr is None or arr.size == 0:
+        return float("nan")
+    return float(arr[0])
+
+def gather_scalar_timeseries(root: Path, t0: int, t1: int, filename: str) -> np.ndarray:
+    T = t1 - t0 + 1
+    y = np.full(T, np.nan, dtype=float)
+    base = root / GRID_REL
+    for t in range(t0, t1 + 1):
+        p = base / str(t) / filename
+        y[t - t0] = read_scalar(p)
+    return y
+
+
+def plot_lines_multi(series_map: Dict[str, np.ndarray],
+                     title: str,
+                     save_path: Path,
+                     y_label: str = "",
+                     x_label: str = "Time (s)",
+                     t0: int = 0):
+    plt.figure(figsize=(8.4, 4.4))
+    for name, y in series_map.items():
+        if y.size == 0:
+            continue
+        x = np.arange(t0, t0 + y.size)
+        plt.plot(x, np.ma.masked_invalid(y), label=name, linewidth=1.5)
+    plt.xlabel(x_label); plt.ylabel(y_label)
+    plt.grid(True, alpha=0.3); plt.legend()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout(); plt.savefig(save_path, dpi=200); plt.close()
 
 
 def read_key_value_pairs(path: Path) -> Optional[Tuple[np.ndarray, np.ndarray]]:
@@ -706,6 +751,86 @@ def figure_4_attack_cost_curves(tests: Dict[str, Path]):
                    pct_scale=False, x_ticks=xticks, markers_only=False)
 
 
+def figure_5_loss_rate_timeseries(tests: Dict[str, Path], t0: int = T_START, t1: int = T_END):
+    out_dir = OUT_DIR / "paper_figures" / "fig5_loss_rates"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pkt = {name: gather_scalar_timeseries(root, t0, t1, FILE_PKT_LOSS_RATE) for name, root in tests.items()}
+    chk = {name: gather_scalar_timeseries(root, t0, t1, FILE_CHUNK_LOSS_RATE) for name, root in tests.items()}
+
+    plot_lines_multi(pkt, "Packet loss rate over time", out_dir / "fig5a_packet_loss_rate.png",
+                     y_label="Loss rate", t0=t0)
+    plot_lines_multi(chk, "Chunk loss rate over time", out_dir / "fig5b_chunk_loss_rate.png",
+                     y_label="Loss rate", t0=t0)
+
+def figure_6_latency_timeseries(tests: Dict[str, Path], t0: int = T_START, t1: int = T_END):
+    out_dir = OUT_DIR / "paper_figures" / "fig6_latency_timeseries"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # mean
+    pkt_mean = {name: gather_scalar_timeseries(root, t0, t1, FILE_PKT_LAT_MEAN) for name, root in tests.items()}
+    chk_mean = {name: gather_scalar_timeseries(root, t0, t1, FILE_CHUNK_LAT_MEAN) for name, root in tests.items()}
+    plot_lines_multi(pkt_mean, "Packet latency (mean) over time", out_dir / "fig6a_packet_latency_mean.png",
+                     y_label="Latency (ms)", t0=t0)
+    plot_lines_multi(chk_mean, "Chunk latency (mean) over time", out_dir / "fig6b_chunk_latency_mean.png",
+                     y_label="Latency (ms)", t0=t0)
+
+    # tail (p95/p99)
+    pkt_p95 = {name: gather_scalar_timeseries(root, t0, t1, FILE_PKT_LAT_P95) for name, root in tests.items()}
+    pkt_p99 = {name: gather_scalar_timeseries(root, t0, t1, FILE_PKT_LAT_P99) for name, root in tests.items()}
+    chk_p95 = {name: gather_scalar_timeseries(root, t0, t1, FILE_CHUNK_LAT_P95) for name, root in tests.items()}
+    chk_p99 = {name: gather_scalar_timeseries(root, t0, t1, FILE_CHUNK_LAT_P99) for name, root in tests.items()}
+
+    plot_lines_multi(pkt_p95, "Packet latency (p95) over time", out_dir / "fig6c_packet_latency_p95.png",
+                     y_label="Latency (ms)", t0=t0)
+    plot_lines_multi(pkt_p99, "Packet latency (p99) over time", out_dir / "fig6d_packet_latency_p99.png",
+                     y_label="Latency (ms)", t0=t0)
+    plot_lines_multi(chk_p95, "Chunk latency (p95) over time", out_dir / "fig6e_chunk_latency_p95.png",
+                     y_label="Latency (ms)", t0=t0)
+    plot_lines_multi(chk_p99, "Chunk latency (p99) over time", out_dir / "fig6f_chunk_latency_p99.png",
+                     y_label="Latency (ms)", t0=t0)
+
+def figure_7_latency_cdf_at_time(tests: Dict[str, Path], t: int = T_END):
+    out_dir = OUT_DIR / "paper_figures" / "fig7_latency_cdf"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Packet latency CDF
+    plt.figure(figsize=(8.4, 4.4))
+    any_data = False
+    for name, root in tests.items():
+        p = root / GRID_REL / str(t) / FILE_PKT_LAT_SAMPLE
+        arr = read_numbers_series(p)
+        if arr is None or arr.size == 0:
+            warn(f"CDF missing/empty: {p}")
+            continue
+        x, y = ecdf(arr)
+        plt.plot(x, y, label=name, linewidth=1.5)
+        any_data = True
+    if any_data:
+        plt.xlabel("Packet latency (ms)"); plt.ylabel("CDF")
+        plt.grid(True, alpha=0.3); plt.legend()
+        plt.tight_layout(); plt.savefig(out_dir / f"fig7a_packet_latency_cdf_t{t}.png", dpi=200)
+    plt.close()
+
+    # Chunk latency CDF
+    plt.figure(figsize=(8.4, 4.4))
+    any_data = False
+    for name, root in tests.items():
+        p = root / GRID_REL / str(t) / FILE_CHUNK_LAT_SAMPLE
+        arr = read_numbers_series(p)
+        if arr is None or arr.size == 0:
+            warn(f"CDF missing/empty: {p}")
+            continue
+        x, y = ecdf(arr)
+        plt.plot(x, y, label=name, linewidth=1.5)
+        any_data = True
+    if any_data:
+        plt.xlabel("Chunk latency (ms)"); plt.ylabel("CDF")
+        plt.grid(True, alpha=0.3); plt.legend()
+        plt.tight_layout(); plt.savefig(out_dir / f"fig7b_chunk_latency_cdf_t{t}.png", dpi=200)
+    plt.close()
+
+
 # =========================
 # Main
 # =========================
@@ -761,6 +886,17 @@ if __name__ == "__main__":
 
     figure_4_attack_cost_curves(tests)
     info(f"Saved Fig-4 attack-cost curves under: {OUT_DIR/'paper_figures'/'fig4_attack_cost'}")
+    
+        # (E) NEW: loss-rate & latency figures
+    figure_5_loss_rate_timeseries(tests, t0=T_START, t1=T_END)
+    info(f"Saved Fig-5 loss rates under: {OUT_DIR/'paper_figures'/'fig5_loss_rates'}")
+
+    figure_6_latency_timeseries(tests, t0=T_START, t1=T_END)
+    info(f"Saved Fig-6 latency time-series under: {OUT_DIR/'paper_figures'/'fig6_latency_timeseries'}")
+
+    figure_7_latency_cdf_at_time(tests, t=T_END)
+    info(f"Saved Fig-7 latency CDF under: {OUT_DIR/'paper_figures'/'fig7_latency_cdf'}")
+
 
     # (C) Also export raw heatmaps for ISL load + GSL UL/DL loss at t=100 (for appendix/debug)
     export_heatmaps_for_tests(HEATMAP_TIMES, tests, filename=FILE_ISL, title_tag="isl_traffic", vmin_vmax=None, show=False)
