@@ -87,7 +87,12 @@ PCDR_P = 0.8                 # 동적 n 계산 시 확률 가중 p (0~1)
 PCDR_MIN_CHUNK = 0.05         # [Mb] 최소 청크(Flow_size=0.5M과 정합)
 PCDR_MAX_K = 64              # 동일 코스트 최단 경로를 한 번에 샘플링할 상한
 
-rng = random.Random(20250917)  # 시드
+BASELINE_CHECK_ALL_CAPS = True   # baseline add_flow()도 UL/ISL/DL 전체 용량 사전검사
+
+
+rng = random.Random(20250917)  # 재현 시드
+
+
 
 
 
@@ -113,6 +118,48 @@ CANDS_BY_SRC  = None         # [src_sat] -> 사전필터된 후보 위성 리스
 # 1) 링크별 실제 누적 트래픽(link_traffic)과 용량의 '초과분'을 사후 계산해 손실로 본다
 # 2) add_flow*_ 가 전체 거부(-1)한 청크의 총량을 별도 합산
 LOSS_BLOCKED_TOTAL = 0.0     # [Mb] 완전 차단된(전혀 수용 안 된) 청크 합계
+
+
+# ===== (NEW) Strict capacity check for latency/loss correctness =====
+# PCDR: 청크 하나라도 용량상 못 올리면 "원본 패킷 전체 손실"(-1) 처리
+PCDR_CHECK_ALL_CAPS = True
+
+# KDS: 가능한 한 링크 전체(UL/ISL/DL) 사전검사 권장
+KDS_CHECK_ALL_CAPS = True   # 기존 False였다면 True로 바꿔주세요.
+
+# ===== (NEW) Latency model knobs =====
+C_KM_PER_S = 299792 
+SLOT_SEC = 1.0  # time_slot 스냅샷이 몇 초 간격인지(기본 1초). 필요하면 50ms면 0.05로.
+
+# ===== (NEW) Packet/Chunk loss counters =====
+PKT_TRIED = 0
+PKT_LOST  = 0
+
+CHUNK_TRIED = 0
+CHUNK_LOST  = 0
+
+# ===== (NEW) Latency accumulators (mean) =====
+CHUNK_LAT_SUM = 0.0
+CHUNK_LAT_CNT = 0
+PKT_LAT_SUM   = 0.0
+PKT_LAT_CNT   = 0
+
+# ===== (NEW) Reservoir sampling for per-packet/per-chunk latency lists =====
+SAVE_LAT_SAMPLE = True
+RESERVOIR_N = 200000
+chunk_lat_sample = []
+pkt_lat_sample   = []
+_seen_chunk = 0
+_seen_pkt   = 0
+
+def reservoir_add(arr, x, seen, cap, rng_obj):
+    if len(arr) < cap:
+        arr.append(x)
+    else:
+        j = rng_obj.randrange(seen)
+        if j < cap:
+            arr[j] = x
+
 
 
 def cir_to_car_np(lat, lng, h):
@@ -254,71 +301,212 @@ def get_one_flow(
             return mid
     return low
 
-def add_flow(src_block, rate=Flow_size):  
-    global link_traffic
+# def add_flow(src_block, rate=Flow_size):  
+#     global link_traffic
+#     src_sat = user_connect_sat[src_block]
+#     if src_sat == -1:
+#         return -1
+#     # traverse all the paths to update link_traffic
+#     uplink = src_sat * 6 + 5
+#     # determine whether the constraints are met
+#     from_sat = src_sat
+#     if path[from_sat] == -1:
+#         return 0
+#     while True:
+#         to_sat = path[from_sat]
+#         if to_sat != from_sat:
+#             link_id_1 = link_seq(from_sat, to_sat)
+#             if link_id_1 == -1:
+#                 print('error!')
+#                 print(from_sat, to_sat)
+#                 exit(0)
+#             link_traffic[link_id_1] += rate
+#             if link_id_1 % 6 == 0:
+#                 isl_traffic[from_sat] += rate  # isl_traffic for dual-traffic 
+#             elif link_id_1 % 6 == 1:
+#                 isl_traffic[to_sat] += rate  # isl_traffic for dual-traffic 
+#             from_sat = to_sat
+#         else:
+#             break
+#     downlink = from_sat * 6 + 4
+#     link_traffic[uplink] += rate
+#     link_traffic[downlink] += rate
+#     uplink_traffic[src_sat] += rate
+#     downlink_traffic[from_sat] += rate
+
+#     if downlink_traffic[from_sat] < downlink_capacity:
+#         # not enough traffic
+#         return 0
+#     else:  # minus extra traffic if overloaded
+#         src_sat = user_connect_sat[src_block]
+#         # traverse all the paths to update link_traffic
+#         uplink = src_sat * 6 + 5
+#         # determine whether the constraints are met
+#         from_sat = src_sat
+#         while True:
+#             to_sat = path[from_sat]
+#             if to_sat != from_sat:
+#                 link_id_1 = link_seq(from_sat, to_sat)
+#                 if link_id_1 == -1:
+#                     print('error!')
+#                     print(from_sat, to_sat)
+#                     exit(0)
+#                 link_traffic[link_id_1] -= rate
+#                 if link_id_1 % 6 == 0:
+#                     isl_traffic[from_sat] -= rate  # isl_traffic for dual-traffic 
+#                 elif link_id_1 % 6 == 1:
+#                     isl_traffic[to_sat] -= rate  # isl_traffic for dual-traffic 
+#                 from_sat = to_sat
+#             else:
+#                 break
+#         downlink = from_sat * 6 + 4
+#         link_traffic[uplink] -= rate
+#         link_traffic[downlink] -= rate
+#         uplink_traffic[src_sat] -= rate
+#         downlink_traffic[from_sat] -= rate
+#         return -1
+
+def add_flow(src_block, rate=Flow_size):
+    """
+    Baseline routing (no splitting):
+    - 성공 시: chunk latency 1개 + packet latency 1개(동일값) 기록
+    - 실패(-1) 시: "원본 패킷 전체 손실"로 처리 (main에서 PKT_LOST 증가)
+    """
+    global link_traffic, isl_traffic, downlink_traffic, uplink_traffic
+    global CHUNK_TRIED, CHUNK_LOST, CHUNK_LAT_SUM, CHUNK_LAT_CNT
+    global PKT_LAT_SUM, PKT_LAT_CNT, _seen_chunk, _seen_pkt
+
     src_sat = user_connect_sat[src_block]
     if src_sat == -1:
+        # 연결 자체가 안 되면 "보낸 걸로 치고" 손실로 보는 편이 일관적입니다.
+        CHUNK_TRIED += 1
+        CHUNK_LOST  += 1
         return -1
-    # traverse all the paths to update link_traffic
+
+    # src -> landing(path[x]==x)까지 노드 리스트
+    nodes = build_nodes_from_next_hop(src_sat, path)
+    if not nodes:
+        # 착륙 위성 자체가 없으면 기존 코드처럼 0 리턴(무시)
+        return 0
+
+    # baseline은 "청크 1개 시도"
+    CHUNK_TRIED += 1
+
+    # -------- (A) strict mode: UL/ISL/DL 전체 용량 사전검사 --------
+    if BASELINE_CHECK_ALL_CAPS:
+        if not _pcdr_can_place_path(nodes, rate, {}):
+            CHUNK_LOST += 1
+            return -1
+
+        # 커밋(원자적으로 반영)
+        # UL
+        ul = nodes[0] * 6 + 5
+        link_traffic[ul] += rate
+        uplink_traffic[nodes[0]] += rate
+
+        # ISL
+        for u_sat, v_sat in zip(nodes[:-1], nodes[1:]):
+            lid = link_seq(u_sat, v_sat)
+            if lid == -1:
+                # 토폴로지 이상(원래는 거의 없어야 함)
+                # 이미 반영한 UL 롤백
+                link_traffic[ul] -= rate
+                uplink_traffic[nodes[0]] -= rate
+                CHUNK_LOST += 1
+                return -1
+            link_traffic[lid] += rate
+            m = lid % 6
+            # 기존 baseline과 동일하게 isl_traffic 집계(0/1만)
+            if m == 0:
+                isl_traffic[u_sat] += rate
+            elif m == 1:
+                isl_traffic[v_sat] += rate
+
+        # DL
+        dl = nodes[-1] * 6 + 4
+        link_traffic[dl] += rate
+        downlink_traffic[nodes[-1]] += rate
+
+        # latency 기록 (baseline은 chunk=packet)
+        lat = estimate_chunk_delay_sec(src_block, nodes, rate)
+        CHUNK_LAT_SUM += lat
+        CHUNK_LAT_CNT += 1
+        PKT_LAT_SUM   += lat
+        PKT_LAT_CNT   += 1
+
+        if SAVE_LAT_SAMPLE:
+            _seen_chunk += 1
+            reservoir_add(chunk_lat_sample, lat, _seen_chunk, RESERVOIR_N, rng)
+            _seen_pkt += 1
+            reservoir_add(pkt_lat_sample, lat, _seen_pkt, RESERVOIR_N, rng)
+
+        return 0
+
+    # -------- (B) legacy mode: 기존 baseline 동작을 최대한 유지(DL 기반 롤백) --------
+    # 기존 add_flow 로직을 거의 그대로 가져오되, 성공했을 때만 latency를 기록합니다.
     uplink = src_sat * 6 + 5
-    # determine whether the constraints are met
     from_sat = src_sat
+
     if path[from_sat] == -1:
         return 0
+
+    # 경로 따라 먼저 더해봄(기존 로직)
+    visited_edges = []
     while True:
         to_sat = path[from_sat]
         if to_sat != from_sat:
             link_id_1 = link_seq(from_sat, to_sat)
             if link_id_1 == -1:
-                print('error!')
-                print(from_sat, to_sat)
-                exit(0)
+                # 구조 오류: 손실 처리
+                CHUNK_LOST += 1
+                return -1
             link_traffic[link_id_1] += rate
+            visited_edges.append((from_sat, to_sat, link_id_1))
             if link_id_1 % 6 == 0:
-                isl_traffic[from_sat] += rate  # isl_traffic for dual-traffic 
+                isl_traffic[from_sat] += rate
             elif link_id_1 % 6 == 1:
-                isl_traffic[to_sat] += rate  # isl_traffic for dual-traffic 
+                isl_traffic[to_sat] += rate
             from_sat = to_sat
         else:
             break
+
     downlink = from_sat * 6 + 4
     link_traffic[uplink] += rate
     link_traffic[downlink] += rate
     uplink_traffic[src_sat] += rate
     downlink_traffic[from_sat] += rate
 
+    # 기존 기준: DL이 capacity 넘어가면 롤백하고 -1
     if downlink_traffic[from_sat] < downlink_capacity:
-        # not enough traffic
-        return 0
-    else:  # minus extra traffic if overloaded
-        src_sat = user_connect_sat[src_block]
-        # traverse all the paths to update link_traffic
-        uplink = src_sat * 6 + 5
-        # determine whether the constraints are met
-        from_sat = src_sat
-        while True:
-            to_sat = path[from_sat]
-            if to_sat != from_sat:
-                link_id_1 = link_seq(from_sat, to_sat)
-                if link_id_1 == -1:
-                    print('error!')
-                    print(from_sat, to_sat)
-                    exit(0)
-                link_traffic[link_id_1] -= rate
-                if link_id_1 % 6 == 0:
-                    isl_traffic[from_sat] -= rate  # isl_traffic for dual-traffic 
-                elif link_id_1 % 6 == 1:
-                    isl_traffic[to_sat] -= rate  # isl_traffic for dual-traffic 
-                from_sat = to_sat
-            else:
-                break
-        downlink = from_sat * 6 + 4
-        link_traffic[uplink] -= rate
-        link_traffic[downlink] -= rate
-        uplink_traffic[src_sat] -= rate
-        downlink_traffic[from_sat] -= rate
-        return -1
+        # 성공 처리: latency 기록 (baseline은 chunk=packet)
+        lat = estimate_chunk_delay_sec(src_block, nodes, rate)
+        CHUNK_LAT_SUM += lat
+        CHUNK_LAT_CNT += 1
+        PKT_LAT_SUM   += lat
+        PKT_LAT_CNT   += 1
 
+        if SAVE_LAT_SAMPLE:
+            _seen_chunk += 1
+            reservoir_add(chunk_lat_sample, lat, _seen_chunk, RESERVOIR_N, rng)
+            _seen_pkt += 1
+            reservoir_add(pkt_lat_sample, lat, _seen_pkt, RESERVOIR_N, rng)
+
+        return 0
+
+    # 롤백
+    for (u_sat, v_sat, lid) in visited_edges:
+        link_traffic[lid] -= rate
+        if lid % 6 == 0:
+            isl_traffic[u_sat] -= rate
+        elif lid % 6 == 1:
+            isl_traffic[v_sat] -= rate
+    link_traffic[uplink] -= rate
+    link_traffic[downlink] -= rate
+    uplink_traffic[src_sat] -= rate
+    downlink_traffic[from_sat] -= rate
+
+    CHUNK_LOST += 1
+    return -1
 
 
 def torus_diff(a, b, mod):
@@ -544,6 +732,72 @@ def k_eqcost_paths_no_rejection(src, dst, k, so, no, rng_obj):
         paths.append(nodes)
     return paths
 
+def build_nodes_from_next_hop(src_sat, next_hop_table):
+    """src_sat에서 시작해 next_hop_table 따라 landing(path[x]==x)까지 노드 리스트 생성"""
+    nodes = [src_sat]
+    cur = src_sat
+    max_steps = len(next_hop_table) + 5
+    for _ in range(max_steps):
+        nxt = next_hop_table[cur]
+        if nxt == -1:
+            return None
+        if nxt == cur:
+            return nodes
+        nodes.append(nxt)
+        cur = nxt
+    return None
+
+def estimate_chunk_delay_sec(src_block, nodes, rate_mbps):
+    """
+    (추정) 지연 = 전파지연(거리/c) + 직렬화지연(전송량/용량)
+    - 거리: user->src_sat, sat->sat..., landing->GS
+    - 직렬화: (rate_mbps * SLOT_SEC) / cap_mbps 를 링크별 합산
+    """
+    # 1) propagation
+    d = 0.0
+    src_sat = nodes[0]
+    d += float(np.linalg.norm(user_pos_car[src_block] - sat_pos_car[src_sat]))
+    for u, v in zip(nodes[:-1], nodes[1:]):
+        d += float(np.linalg.norm(sat_pos_car[u] - sat_pos_car[v]))
+    landing = nodes[-1]
+    gs_id = sat_connect_gs[landing]
+    if gs_id != -1:
+        d += float(np.linalg.norm(sat_pos_car[landing] - GS_pos_car[gs_id]))
+    t_prop = d / C_KM_PER_S
+
+    # 2) serialization (data = rate * SLOT_SEC)
+    data_mbit = rate_mbps * SLOT_SEC
+    t_ser = (data_mbit / bandwidth_uplink)
+    for _ in zip(nodes[:-1], nodes[1:]):
+        t_ser += (data_mbit / bandwidth_isl)
+    t_ser += (data_mbit / bandwidth_downlink)
+
+    return t_prop + t_ser
+
+def _cap(idx: int) -> float:
+    return _get_link_capacity_by_index(idx)
+
+def _pcdr_can_place_path(nodes, per, ops_link):
+    """(현재 link_traffic + 임시 ops_link + per) 가 용량을 넘지 않는지 UL/ISL/DL 전체 검사"""
+    # UL
+    ul = nodes[0] * 6 + 5
+    if link_traffic[ul] + ops_link.get(ul, 0.0) + per > _cap(ul):
+        return False
+
+    # ISL
+    for u_sat, v_sat in zip(nodes[:-1], nodes[1:]):
+        lid = link_seq(u_sat, v_sat)
+        if lid == -1:
+            return False
+        if link_traffic[lid] + ops_link.get(lid, 0.0) + per > _cap(lid):
+            return False
+
+    # DL
+    dl = nodes[-1] * 6 + 4
+    if link_traffic[dl] + ops_link.get(dl, 0.0) + per > _cap(dl):
+        return False
+
+    return True
 
 
 def get_landing_sat(src_sat):  # 기존 이름 호환
@@ -631,77 +885,198 @@ def pick_paths_diverse(pool, n, rng_obj):
 
 
 
+# def add_flow_pcdr(src_block, rate=Flow_size):
+#     """
+#     (중요) 기존과 달리 '착륙 위성'을 여러 개로 분산.
+#     - 같은 GS에 연결된 착륙 위성들 중 hop 비용이 비슷한 후보들을 모으고,
+#     - rate를 n개 청크로 나눈 뒤 라운드로빈으로 후보들에 배정,
+#     - 각 후보의 downlink 용량을 초과하지 않도록 미리 검사하고,
+#     - 전부 배정 가능할 때만 실제 누적(원자적 적용).
+#     """
+#     global link_traffic, isl_traffic, downlink_traffic, uplink_traffic
+
+#     src_sat = user_connect_sat[src_block]
+#     if src_sat == -1:
+#         return -1
+
+#     # 후보 착륙 위성 집합
+#     candidates = get_landing_candidates(src_sat)
+#     if not candidates:
+#         return 0
+
+#     # 동적 n 계산 (논문식) — per가 최소청크 미만이 되지 않도록 cap
+#     F = rate
+#     S = PCDR_MIN_CHUNK
+#     u = rng.random()
+#     n_raw = math.ceil((F / S) * (1 + PCDR_P * u))
+#     n_cap = max(1, int(F / S))   # floor(F/S)
+#     n_total = max(1, min(n_raw, n_cap))
+#     per = F / n_total
+
+#     # 사전 용량 점검: 후보 downlink의 남은 용량 합이 rate 이상인지
+#     total_avail = 0.0
+#     for c in candidates:
+#         total_avail += max(0.0, downlink_capacity - downlink_traffic[c])
+#     if total_avail + 1e-9 < rate:
+#         return -1  
+
+#     # 후보별 경로 풀은 한 번만 준비
+#     pool_local = {}
+#     for c in candidates:
+#         pool = get_path_pool_cached(src_sat, c, sat_of_orbit, num_of_orbit)
+#         pool_local[c] = pool if pool else []
+
+#     # 거대한 0-배열 대신 작은 dict에 임시 누적
+#     ops_link = {}  # {link_idx: delta}
+#     ops_isl  = {}  # {sat_idx:  delta}
+#     ops_dl   = {}  # {sat_idx:  delta}
+#     ops_ul   = {}  # {sat_idx:  delta}
+#     def acc(d, k, v): d[k] = d.get(k, 0) + v
+
+#     # 후보는 get_landing_candidates에서 이미 DL부하 낮은 순
+
+#     rr = 0
+#     placed = 0
+#     # 각 후보별 임시로 추가되는 downlink를 추적(사전 배정 시 용량 체크용)
+#     cand_td = {c: 0.0 for c in candidates}
+
+#     while placed < n_total:
+#         progressed = False
+#         for _ in range(len(candidates)):
+#             c = candidates[rr % len(candidates)]
+#             rr += 1
+#             # 이 후보의 downlink 용량 여유?
+#             if downlink_traffic[c] + cand_td[c] + per > downlink_capacity:
+#                 continue
+
+#             # (src→c) 최단 경로 중 하나 선택 (사전준비 풀 사용)
+#             pool = pool_local[c]
+#             if not pool:
+#                 continue
+#             nodes = rng.choice(pool)
+
+#             # 임시 누적 (UL)
+#             ul = nodes[0] * 6 + 5
+#             acc(ops_link, ul, per)
+#             acc(ops_ul,   nodes[0], per)
+
+#             # ISL
+#             for u_sat, v_sat in zip(nodes[:-1], nodes[1:]):
+#                 lid = link_seq(u_sat, v_sat)
+#                 if lid == -1:
+#                     return 0  # 연결 테이블 오류
+#                 acc(ops_link, lid, per)
+#                 m = lid % 6
+#                 if m == 0:
+#                     acc(ops_isl, u_sat, per)
+#                 elif m == 1:
+#                     acc(ops_isl, v_sat, per)
+#             # DL (nodes[-1] == c)
+#             dl = nodes[-1] * 6 + 4
+#             acc(ops_link, dl, per)
+#             acc(ops_dl,   nodes[-1], per)
+#             cand_td[c] += per
+
+#             placed += 1
+#             progressed = True
+#             if placed >= n_total:
+#                 break
+#         if not progressed:
+#             # 한 바퀴 돌 동안 아무 것도 못 배정 → 전체 취소
+#             return -1
+
+#     # 모든 청크 배정 성공 → 원샷 커밋
+#     for i, v in ops_link.items(): link_traffic[i]     += v
+#     for i, v in ops_isl.items():  isl_traffic[i]      += v
+#     for i, v in ops_dl.items():   downlink_traffic[i] += v
+#     for i, v in ops_ul.items():   uplink_traffic[i]   += v
+#     return 0
+
+
 def add_flow_pcdr(src_block, rate=Flow_size):
     """
-    (중요) 기존과 달리 '착륙 위성'을 여러 개로 분산.
-    - 같은 GS에 연결된 착륙 위성들 중 hop 비용이 비슷한 후보들을 모으고,
-    - rate를 n개 청크로 나눈 뒤 라운드로빈으로 후보들에 배정,
-    - 각 후보의 downlink 용량을 초과하지 않도록 미리 검사하고,
-    - 전부 배정 가능할 때만 실제 누적(원자적 적용).
+    (PCDR) 분할 전송:
+    - 청크 하나라도 못 배정되면 => 원본 패킷 전체 손실(-1)
+    - 성공 시: (1) 청크 지연(각 청크), (2) 원본 지연=max(청크지연) 기록
     """
     global link_traffic, isl_traffic, downlink_traffic, uplink_traffic
+    global CHUNK_TRIED, CHUNK_LOST, CHUNK_LAT_SUM, CHUNK_LAT_CNT
+    global PKT_LAT_SUM, PKT_LAT_CNT, _seen_chunk, _seen_pkt
+    global CHUNK_LOST
 
     src_sat = user_connect_sat[src_block]
     if src_sat == -1:
         return -1
 
-    # 후보 착륙 위성 집합
     candidates = get_landing_candidates(src_sat)
     if not candidates:
         return 0
 
-    # 동적 n 계산 (논문식) — per가 최소청크 미만이 되지 않도록 cap
+    # 동적 n 계산
     F = rate
     S = PCDR_MIN_CHUNK
     u = rng.random()
     n_raw = math.ceil((F / S) * (1 + PCDR_P * u))
-    n_cap = max(1, int(F / S))   # floor(F/S)
+    n_cap = max(1, int(F / S))
     n_total = max(1, min(n_raw, n_cap))
     per = F / n_total
 
-    # 사전 용량 점검: 후보 downlink의 남은 용량 합이 rate 이상인지
+    # (NEW) chunk tried: 성공/실패와 무관하게 "시도한 원본의 청크 개수"
+    CHUNK_TRIED += n_total
+
+    # downlink 남은 용량 합 sanity check(빠른 reject)
     total_avail = 0.0
     for c in candidates:
         total_avail += max(0.0, downlink_capacity - downlink_traffic[c])
     if total_avail + 1e-9 < rate:
-        return -1  
+        CHUNK_LOST += n_total
+        return -1
 
-    # 후보별 경로 풀은 한 번만 준비
+    # 경로 풀 준비
     pool_local = {}
     for c in candidates:
         pool = get_path_pool_cached(src_sat, c, sat_of_orbit, num_of_orbit)
         pool_local[c] = pool if pool else []
 
-    # 거대한 0-배열 대신 작은 dict에 임시 누적
-    ops_link = {}  # {link_idx: delta}
-    ops_isl  = {}  # {sat_idx:  delta}
-    ops_dl   = {}  # {sat_idx:  delta}
-    ops_ul   = {}  # {sat_idx:  delta}
-    def acc(d, k, v): d[k] = d.get(k, 0) + v
-
-    # 후보는 get_landing_candidates에서 이미 DL부하 낮은 순
+    # 임시 누적 dict
+    ops_link = {}
+    ops_isl  = {}
+    ops_dl   = {}
+    ops_ul   = {}
+    def acc(d, k, v): d[k] = d.get(k, 0.0) + v
 
     rr = 0
     placed = 0
-    # 각 후보별 임시로 추가되는 downlink를 추적(사전 배정 시 용량 체크용)
     cand_td = {c: 0.0 for c in candidates}
+
+    # latency list for this original packet
+    chunk_delays = []
 
     while placed < n_total:
         progressed = False
         for _ in range(len(candidates)):
             c = candidates[rr % len(candidates)]
             rr += 1
-            # 이 후보의 downlink 용량 여유?
+
+            # 후보 DL 여유 체크(빠른 prune)
             if downlink_traffic[c] + cand_td[c] + per > downlink_capacity:
                 continue
 
-            # (src→c) 최단 경로 중 하나 선택 (사전준비 풀 사용)
             pool = pool_local[c]
             if not pool:
                 continue
             nodes = rng.choice(pool)
 
-            # 임시 누적 (UL)
+            # 전체 링크 용량 사전검사: 못 올리면 다른 경로/착륙 후보로
+            if PCDR_CHECK_ALL_CAPS:
+                if not _pcdr_can_place_path(nodes, per, ops_link):
+                    continue
+
+            # latency (추정)
+            lat = estimate_chunk_delay_sec(src_block, nodes, per)
+            chunk_delays.append(lat)
+
+            # 임시 누적(UL)
             ul = nodes[0] * 6 + 5
             acc(ops_link, ul, per)
             acc(ops_ul,   nodes[0], per)
@@ -710,14 +1085,17 @@ def add_flow_pcdr(src_block, rate=Flow_size):
             for u_sat, v_sat in zip(nodes[:-1], nodes[1:]):
                 lid = link_seq(u_sat, v_sat)
                 if lid == -1:
-                    return 0  # 연결 테이블 오류
+                    # 구조 오류면 패킷 손실 처리
+                    CHUNK_LOST += (n_total - placed)
+                    return -1
                 acc(ops_link, lid, per)
                 m = lid % 6
                 if m == 0:
                     acc(ops_isl, u_sat, per)
                 elif m == 1:
                     acc(ops_isl, v_sat, per)
-            # DL (nodes[-1] == c)
+
+            # DL
             dl = nodes[-1] * 6 + 4
             acc(ops_link, dl, per)
             acc(ops_dl,   nodes[-1], per)
@@ -727,55 +1105,128 @@ def add_flow_pcdr(src_block, rate=Flow_size):
             progressed = True
             if placed >= n_total:
                 break
+
         if not progressed:
-            # 한 바퀴 돌 동안 아무 것도 못 배정 → 전체 취소
+            # 한 바퀴 동안 청크 배정 실패 => 원본 패킷 전체 손실
+            CHUNK_LOST += (n_total - placed)
             return -1
 
-    # 모든 청크 배정 성공 → 원샷 커밋
+    # 성공 => 원샷 커밋
     for i, v in ops_link.items(): link_traffic[i]     += v
     for i, v in ops_isl.items():  isl_traffic[i]      += v
     for i, v in ops_dl.items():   downlink_traffic[i] += v
     for i, v in ops_ul.items():   uplink_traffic[i]   += v
+
+    # (NEW) latency accounting
+    for lat in chunk_delays:
+        CHUNK_LAT_SUM += lat
+        CHUNK_LAT_CNT += 1
+        if SAVE_LAT_SAMPLE:
+            _seen_chunk += 1
+            reservoir_add(chunk_lat_sample, lat, _seen_chunk, RESERVOIR_N, rng)
+
+    pkt_lat = max(chunk_delays) if chunk_delays else 0.0
+    PKT_LAT_SUM += pkt_lat
+    PKT_LAT_CNT += 1
+    if SAVE_LAT_SAMPLE:
+        _seen_pkt += 1
+        reservoir_add(pkt_lat_sample, pkt_lat, _seen_pkt, RESERVOIR_N, rng)
+
     return 0
 
 
+# def add_flow_kds(src_block, rate=Flow_size):
+#     """
+#     k-DS (no packet splitting) per-chunk ECMP:
+#     - (src_sat, landing_sat) 쌍별로 ISL-분리 k경로 집합 생성/캐시
+#     - 같은 쌍이 재등장할 때마다 라운드로빈으로 다음 경로 시도
+#     - 용량 사전검사 통과 시 원샷 커밋, 전부 실패면 -1
+#     """
+#     global link_traffic, isl_traffic, downlink_traffic, uplink_traffic
+
+#     src_sat = user_connect_sat[src_block]
+#     if src_sat == -1:
+#         return -1
+
+#     landing_sat = get_landing_sat(src_sat)  # path[] 기반 기본 착륙 위성
+#     if landing_sat == -1:
+#         return 0
+
+#     paths = get_kds_pathset(src_sat, landing_sat)
+#     if not paths:
+#         # 동코스트 경로 풀 없음 → 기본 경로 하나도 없는 특이 케이스: 그냥 무시
+#         return 0
+
+#     # 라운드로빈 시작 위치
+#     rr_key = (src_sat, landing_sat, KDS_K, int(KDS_NODE_DISJOINT))
+#     i0 = KDS_RR_IDX.get(rr_key, 0)
+#     L = len(paths)
+
+#     # i0부터 한 바퀴 돌며 가능한 경로를 찾는다
+#     for shift in range(L):
+#         nodes = paths[(i0 + shift) % L]
+#         if _kds_is_feasible(nodes, rate):
+#             _kds_commit(nodes, rate)
+#             # 이번에 성공한 다음 칸으로 커서 전진
+#             KDS_RR_IDX[rr_key] = i0 + shift + 1
+#             return 0
+
+#     # 모든 후보가 현재 용량 제약으로 실패
+#     return -1
+
 def add_flow_kds(src_block, rate=Flow_size):
     """
-    k-DS (no packet splitting) per-chunk ECMP:
-    - (src_sat, landing_sat) 쌍별로 ISL-분리 k경로 집합 생성/캐시
-    - 같은 쌍이 재등장할 때마다 라운드로빈으로 다음 경로 시도
-    - 용량 사전검사 통과 시 원샷 커밋, 전부 실패면 -1
+    k-DS (no packet splitting):
+    - 성공 시: chunk latency 1개 + packet latency 1개(동일값) 기록
+    - 실패(-1) 시: 패킷 손실은 main에서 카운트
     """
     global link_traffic, isl_traffic, downlink_traffic, uplink_traffic
+    global CHUNK_TRIED, CHUNK_LOST, CHUNK_LAT_SUM, CHUNK_LAT_CNT
+    global PKT_LAT_SUM, PKT_LAT_CNT, _seen_chunk, _seen_pkt
 
     src_sat = user_connect_sat[src_block]
     if src_sat == -1:
         return -1
 
-    landing_sat = get_landing_sat(src_sat)  # path[] 기반 기본 착륙 위성
+    landing_sat = get_landing_sat(src_sat)
     if landing_sat == -1:
         return 0
 
     paths = get_kds_pathset(src_sat, landing_sat)
     if not paths:
-        # 동코스트 경로 풀 없음 → 기본 경로 하나도 없는 특이 케이스: 그냥 무시
         return 0
 
-    # 라운드로빈 시작 위치
+    # (NEW) KDS도 "청크 1개 시도"로 카운트(분할 없음)
+    CHUNK_TRIED += 1
+
     rr_key = (src_sat, landing_sat, KDS_K, int(KDS_NODE_DISJOINT))
     i0 = KDS_RR_IDX.get(rr_key, 0)
     L = len(paths)
 
-    # i0부터 한 바퀴 돌며 가능한 경로를 찾는다
     for shift in range(L):
         nodes = paths[(i0 + shift) % L]
         if _kds_is_feasible(nodes, rate):
             _kds_commit(nodes, rate)
-            # 이번에 성공한 다음 칸으로 커서 전진
             KDS_RR_IDX[rr_key] = i0 + shift + 1
+
+            # (NEW) latency (추정)
+            lat = estimate_chunk_delay_sec(src_block, nodes, rate)
+
+            CHUNK_LAT_SUM += lat
+            CHUNK_LAT_CNT += 1
+            PKT_LAT_SUM   += lat
+            PKT_LAT_CNT   += 1
+
+            if SAVE_LAT_SAMPLE:
+                _seen_chunk += 1
+                reservoir_add(chunk_lat_sample, lat, _seen_chunk, RESERVOIR_N, rng)
+                _seen_pkt += 1
+                reservoir_add(pkt_lat_sample, lat, _seen_pkt, RESERVOIR_N, rng)
+
             return 0
 
-    # 모든 후보가 현재 용량 제약으로 실패
+    # 전부 실패 => 이 패킷은 못 감
+    CHUNK_LOST += 1
     return -1
 
 
@@ -793,7 +1244,7 @@ if __name__ == "__main__":
             sat_pos_car.append(
                 cir_to_car_np(float(satPos[0]), float(satPos[1]),
                               float(satPos[2])))
-        sat_pos_car = np.array(sat_pos_car)
+    sat_pos_car = np.array(sat_pos_car)
 
     # load user positions
     for lat in range(inclination, -inclination, -1):  # [inclination, -inclination]
@@ -868,30 +1319,30 @@ if __name__ == "__main__":
     # initiate traffic flows and weights
     init_flows() 
 
-    for add_flow_times in range(2000000):  # randomly choose 2000000 flows
-        flow_id = get_one_flow(flows_cumulate_weight, flows_num,
-                               flows_sum_weight)
-        # 기존: res = add_flow(flows[flow_id][0])
-        # 라우팅 함수 선택
+    for add_flow_times in range(2000000):
+        flow_id = get_one_flow(flows_cumulate_weight, flows_num, flows_sum_weight)
+        src_block = flows[flow_id][0]
+
+        PKT_TRIED += 1
+
         if KDS_ENABLE:
-            res = add_flow_kds(flows[flow_id][0])
+            res = add_flow_kds(src_block)
         elif PCDR_ENABLE:
-            res = add_flow_pcdr(flows[flow_id][0])
+            res = add_flow_pcdr(src_block)
         else:
-            res = add_flow(flows[flow_id][0])
-
-
+            res = add_flow(src_block)
 
         if res == -1:
-            # 패킷 손실 집계
+            PKT_LOST += 1
             LOSS_BLOCKED_TOTAL += Flow_size
             continue
-        # add a new flow
+
         flow_pair = (flows[flow_id][0], flows[flow_id][1])
         if flow_pair in flows_selected:
-            flows_selected[flow_pair] += Flow_size  
+            flows_selected[flow_pair] += Flow_size
         else:
             flows_selected[flow_pair] = Flow_size
+
 
     # outputs: ISL, GSL down/uplink, block connecstions, satellite connections and so on
     os.system("mkdir -p ../" + cons_name + "/+grid_data/link_traffic_data/" +
@@ -971,3 +1422,33 @@ if __name__ == "__main__":
     np.savetxt(out_dir + '/uplink_loss.txt',    uplink_loss,    fmt='%.3f')
     np.savetxt(out_dir + '/blocked_loss_total.txt', np.array([LOSS_BLOCKED_TOTAL], dtype=float), fmt='%.3f')
     # 참고: 손실 총합(추정) = sum(link_loss) 중 (m==4,5) + LOSS_BLOCKED_TOTAL
+    
+    # ===== (NEW) Packet-level loss rate =====
+    pkt_loss_rate = PKT_LOST / max(1, PKT_TRIED)
+    np.savetxt(out_dir + '/packet_loss_rate.txt', np.array([pkt_loss_rate], dtype=float), fmt='%.6f')
+    np.savetxt(out_dir + '/packet_loss_count.txt', np.array([PKT_LOST, PKT_TRIED], dtype=int), fmt='%d')
+
+    # ===== (NEW) Chunk-level loss rate (참고용) =====
+    chunk_loss_rate = CHUNK_LOST / max(1, CHUNK_TRIED)
+    np.savetxt(out_dir + '/chunk_loss_rate.txt', np.array([chunk_loss_rate], dtype=float), fmt='%.6f')
+    np.savetxt(out_dir + '/chunk_loss_count.txt', np.array([CHUNK_LOST, CHUNK_TRIED], dtype=int), fmt='%d')
+
+    # ===== (NEW) Latency means (ms) =====
+    chunk_mean = CHUNK_LAT_SUM / max(1, CHUNK_LAT_CNT)
+    pkt_mean   = PKT_LAT_SUM   / max(1, PKT_LAT_CNT)
+    np.savetxt(out_dir + '/chunk_latency_mean_ms.txt', np.array([chunk_mean * 1000.0]), fmt='%.6f')
+    np.savetxt(out_dir + '/packet_latency_mean_ms.txt', np.array([pkt_mean   * 1000.0]), fmt='%.6f')
+
+    # ===== (NEW) Latency samples (ms) + percentiles from sample =====
+    if SAVE_LAT_SAMPLE:
+        cl = np.array(chunk_lat_sample, dtype=float) * 1000.0
+        pl = np.array(pkt_lat_sample, dtype=float)   * 1000.0
+        np.savetxt(out_dir + '/chunk_latency_sample_ms.txt',  cl, fmt='%.3f')
+        np.savetxt(out_dir + '/packet_latency_sample_ms.txt', pl, fmt='%.3f')
+
+        if len(cl) > 0:
+            np.savetxt(out_dir + '/chunk_latency_p95_ms.txt', np.array([np.percentile(cl, 95)]), fmt='%.3f')
+            np.savetxt(out_dir + '/chunk_latency_p99_ms.txt', np.array([np.percentile(cl, 99)]), fmt='%.3f')
+        if len(pl) > 0:
+            np.savetxt(out_dir + '/packet_latency_p95_ms.txt', np.array([np.percentile(pl, 95)]), fmt='%.3f')
+            np.savetxt(out_dir + '/packet_latency_p99_ms.txt', np.array([np.percentile(pl, 99)]), fmt='%.3f')
